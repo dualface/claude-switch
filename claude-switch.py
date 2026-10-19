@@ -3,10 +3,12 @@
 
 import argparse
 import contextlib
+import ctypes
 import fcntl
 import json
 import os
 from pathlib import Path
+import pwd
 import shutil
 import subprocess
 import sys
@@ -19,6 +21,15 @@ PRIVATE_FILES = (".credentials.json", "daemon.log", "stats-cache.json")
 PRIVATE_DIRECTORIES = ("daemon", "jobs", "telemetry", "cache", "backups")
 # Account metadata lives at ~/.claude.json, not inside ~/.claude.
 METADATA = ".claude.json"
+# On macOS Claude keeps the login in the login keychain and never reads .credentials.json.
+USES_KEYCHAIN = sys.platform == "darwin"
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+KEYCHAIN_ITEM_NOT_FOUND = 44
+# errSecInteractionNotAllowed: the keychain is locked, as it is in an SSH session; security prints nothing.
+KEYCHAIN_INTERACTION_NOT_ALLOWED = 36
+# security -i drops input lines of 4096 bytes or more.
+SECURITY_LINE_LIMIT = 4000
+PROC_PIDPATHINFO_MAXSIZE = 4096
 
 
 def accounts_directory():
@@ -70,19 +81,22 @@ def selected_account():
     return account
 
 
-def write_selection(account):
-    target = selection_file()
-    # Readers see either complete selection.
-    fd, temporary = tempfile.mkstemp(prefix=".current-", dir=target.parent)
+def write_private_file(target, text):
+    # Readers see either the old or the new content; mkstemp makes the file 0600.
+    fd, temporary = tempfile.mkstemp(prefix=f".{target.name}-", dir=target.parent)
     try:
         with os.fdopen(fd, "w") as output:
-            output.write(account + "\n")
+            output.write(text)
             output.flush()
             os.fsync(output.fileno())
         os.replace(temporary, target)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def write_selection(account):
+    write_private_file(selection_file(), account + "\n")
 
 
 def existing_account_directory(account):
@@ -132,20 +146,106 @@ def link_account(account):
                 temporary.unlink()
 
 
-def running_claude_pids():
-    # The native launcher points at versions/<version>; every running Claude executes one of them.
-    versions = native_cli().resolve().parent
-    pids = []
+def keychain_account():
+    # Claude names its keychain item after the login user.
+    return os.environ.get("USER") or pwd.getpwuid(os.getuid()).pw_name
+
+
+def run_security(*arguments, stdin=None):
+    return subprocess.run(["security", *arguments], input=stdin, capture_output=True, text=True, timeout=20)
+
+
+def keychain_error(action, result):
+    if result.returncode == KEYCHAIN_INTERACTION_NOT_ALLOWED:
+        return ValueError(f"{action}钥匙串登录信息失败：钥匙串已锁定或不允许访问（SSH 会话中常见）；"
+                          "请先运行 security unlock-keychain 解锁后重试，未切换账号")
+    lines = result.stderr.strip().splitlines()
+    detail = f"：{lines[0]}" if lines else ""
+    return ValueError(f"{action}钥匙串登录信息失败（退出码 {result.returncode}）{detail}")
+
+
+def read_keychain_login():
+    """Return the login Claude keeps in the keychain, or None when there is none."""
+    result = run_security("find-generic-password", "-a", keychain_account(), "-s", KEYCHAIN_SERVICE, "-w")
+    if result.returncode == KEYCHAIN_ITEM_NOT_FOUND:
+        return None
+    if result.returncode:
+        raise keychain_error("读取", result)
+    return result.stdout.removesuffix("\n")
+
+
+def write_keychain_login(login):
+    # Hex through stdin keeps the token out of the process list.
+    command = (f'add-generic-password -U -a "{keychain_account()}" -s "{KEYCHAIN_SERVICE}" '
+               f"-X {login.encode().hex()}\n")
+    if len(command.encode()) > SECURITY_LINE_LIMIT:
+        raise ValueError("登录信息过长，无法安全写入钥匙串")
+    result = run_security("-i", stdin=command)
+    if result.returncode:
+        raise keychain_error("写入", result)
+
+
+def delete_keychain_login():
+    result = run_security("delete-generic-password", "-a", keychain_account(), "-s", KEYCHAIN_SERVICE)
+    if result.returncode not in (0, KEYCHAIN_ITEM_NOT_FOUND):
+        raise keychain_error("删除", result)
+
+
+def store_keychain_login(account):
+    """Save the keychain login, which supersedes the stored copy, into the account that used it."""
+    if not USES_KEYCHAIN:
+        return
+    login = read_keychain_login()
+    if login is not None:
+        write_private_file(account_directory(account) / ".credentials.json", login)
+
+
+def load_keychain_login(account):
+    """Give Claude the saved login of the account; without one Claude asks to log in."""
+    if not USES_KEYCHAIN:
+        return
+    stored = account_directory(account) / ".credentials.json"
+    if stored.is_file():
+        write_keychain_login(stored.read_text())
+    else:
+        delete_keychain_login()
+
+
+def darwin_process_executables():
+    # macOS has no /proc; libproc reports the same executable paths.
+    libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    count = libproc.proc_listallpids(None, 0)
+    if count < 0:
+        raise OSError(ctypes.get_errno(), "无法列出进程")
+    # Leave room for processes started between the two calls.
+    pids = (ctypes.c_int * (count + 64))()
+    count = libproc.proc_listallpids(pids, ctypes.sizeof(pids))
+    if count < 0:
+        raise OSError(ctypes.get_errno(), "无法列出进程")
+    path = ctypes.create_string_buffer(PROC_PIDPATHINFO_MAXSIZE)
+    for pid in pids[:count]:
+        if libproc.proc_pidpath(pid, path, ctypes.sizeof(path)) > 0:
+            yield pid, Path(os.fsdecode(path.value))
+
+
+def process_executables():
+    """Yield (pid, executable path) for every process whose executable is readable."""
+    if sys.platform == "darwin":
+        yield from darwin_process_executables()
+        return
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
         try:
-            executable = Path(os.readlink(entry / "exe"))
+            yield int(entry.name), Path(os.readlink(entry / "exe"))
         except OSError:
             continue
-        if executable.parent == versions:
-            pids.append(int(entry.name))
-    return sorted(pids)
+
+
+def running_claude_pids():
+    # The native launcher points at versions/<version>; every running Claude executes one of them.
+    versions = native_cli().resolve().parent
+    return sorted(pid for pid, executable in process_executables() if executable.parent == versions)
 
 
 def confirmed_in_terminal(message, expected, refusal):
@@ -178,8 +278,11 @@ def switch_account(account):
         if not confirmed_despite_running_claude(account):
             print("已取消，未切换账号。")
             return False
-        store_live_entries(selected_account())
+        current = selected_account()
+        store_live_entries(current)
+        store_keychain_login(current)
         link_account(account)
+        load_keychain_login(account)
         write_selection(account)
     print(f"已切换到账号 {account}。")
     return True
@@ -195,6 +298,7 @@ def initialize():
             account = "1"
             account_directory(account).mkdir(mode=0o700, exist_ok=True)
         store_live_entries(account)
+        store_keychain_login(account)
         link_account(account)
         if not selection_file().exists():
             write_selection(account)

@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -31,6 +32,33 @@ if sys.argv[1:3] == ["auth", "status"]:
     sys.exit(0 if logged_in else 1)
 print(json.dumps({"args": sys.argv[1:], "config": os.environ.get("CLAUDE_CONFIG_DIR")}))
 '''
+# Stands in for /usr/bin/security so that no test touches the real keychain.
+FAKE_SECURITY = '''#!/usr/bin/python3
+import json, shlex, sys
+from pathlib import Path
+store = Path.home() / "fake-keychain.json"
+if (Path.home() / "fake-keychain-locked").exists():
+    sys.exit(36)
+items = json.loads(store.read_text()) if store.exists() else {}
+def run(command, *rest):
+    rest = [argument for argument in rest if argument not in ("-U", "-w")]
+    options = dict(zip(rest[::2], rest[1::2]))
+    key = options["-a"] + "/" + options["-s"]
+    if command == "find-generic-password":
+        if key not in items:
+            sys.exit(44)
+        print(bytes.fromhex(items[key]).decode())
+    elif command == "add-generic-password":
+        items[key] = options["-X"]
+    elif items.pop(key, None) is None:
+        sys.exit(44)
+    store.write_text(json.dumps(items))
+if sys.argv[1] == "-i":
+    for line in sys.stdin:
+        run(*shlex.split(line))
+else:
+    run(*sys.argv[1:])
+'''
 
 
 class SwitchTests(unittest.TestCase):
@@ -44,6 +72,9 @@ class SwitchTests(unittest.TestCase):
         native = self.bin / "claude"
         native.write_text(FAKE)
         native.chmod(0o700)
+        security = self.bin / "security"
+        security.write_text(FAKE_SECURITY)
+        security.chmod(0o700)
         for relative in PRIVATE + SHARED:
             path = self.home / relative
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -67,13 +98,26 @@ class SwitchTests(unittest.TestCase):
 
     def in_home(self, function, *arguments, tty=True, answers=(), pids=()):
         output = io.StringIO()
-        with patch.dict(os.environ, {"HOME": str(self.home)}), \
+        with patch.dict(os.environ, {"HOME": str(self.home), "PATH": self.env["PATH"]}), \
                 patch.object(sys.stdin, "isatty", return_value=tty), \
                 patch("builtins.input", side_effect=list(answers)), \
                 patch.object(switch, "running_claude_pids", return_value=list(pids)), \
                 contextlib.redirect_stdout(output):
             result = function(*arguments)
         return result, output.getvalue()
+
+    def keychain_key(self):
+        with patch.dict(os.environ, {"HOME": str(self.home)}):
+            return f"{switch.keychain_account()}/{switch.KEYCHAIN_SERVICE}"
+
+    def set_keychain(self, login):
+        (self.home / "fake-keychain.json").write_text(json.dumps({self.keychain_key(): login.encode().hex()}))
+
+    def keychain(self):
+        store = self.home / "fake-keychain.json"
+        items = json.loads(store.read_text()) if store.exists() else {}
+        login = items.get(self.keychain_key())
+        return None if login is None else bytes.fromhex(login).decode()
 
     def assert_linked_to(self, account):
         for relative in PRIVATE:
@@ -146,6 +190,59 @@ class SwitchTests(unittest.TestCase):
         self.assertTrue(switched)
         self.assertIn("可能把原账号的配置和令牌写进账号 2", output)
         self.assert_linked_to("2")
+
+    def test_running_claude_pids_finds_native_versions(self):
+        version = self.home / ".local/share/claude/versions/1.0"
+        version.parent.mkdir(parents=True)
+        shutil.copy("/bin/sleep", version)
+        if sys.platform == "darwin":
+            # macOS kills a copied system binary until it is signed again.
+            subprocess.run(["codesign", "--force", "--sign", "-", str(version)], check=True, capture_output=True)
+        (self.bin / "claude").unlink()
+        (self.bin / "claude").symlink_to(version)
+        running = subprocess.Popen([str(self.bin / "claude"), "30"])
+        self.addCleanup(running.wait)
+        self.addCleanup(running.kill)
+        with patch.dict(os.environ, {"HOME": str(self.home)}):
+            self.assertEqual(switch.running_claude_pids(), [running.pid])
+
+    def test_use_on_macos_swaps_keychain_login(self):
+        self.assertEqual(self.command("add", "2").returncode, 0)
+        (self.accounts / "account-2/.credentials.json").write_text("account two login")
+        self.set_keychain("account one keychain")
+        with patch.object(switch, "USES_KEYCHAIN", True):
+            self.in_home(switch.switch_account, "2")
+            self.assertEqual(self.keychain(), "account two login")
+            self.assertEqual((self.accounts / "account-1/.credentials.json").read_text(), "account one keychain")
+            # Claude refreshes the token in the keychain while account 2 is active.
+            self.set_keychain("account two refreshed")
+            self.in_home(switch.switch_account, "1")
+        self.assertEqual(self.keychain(), "account one keychain")
+        stored = self.accounts / "account-2/.credentials.json"
+        self.assertEqual(stored.read_text(), "account two refreshed")
+        self.assertEqual(stored.stat().st_mode & 0o777, 0o600)
+
+    def test_use_on_macos_clears_keychain_for_account_without_login(self):
+        self.assertEqual(self.command("add", "3").returncode, 0)
+        self.set_keychain("account one keychain")
+        with patch.object(switch, "USES_KEYCHAIN", True):
+            self.in_home(switch.switch_account, "3")
+        self.assertIsNone(self.keychain())
+        self.assertEqual((self.accounts / "account-1/.credentials.json").read_text(), "account one keychain")
+
+    def test_use_on_macos_stops_when_keychain_fails(self):
+        self.assertEqual(self.command("add", "2").returncode, 0)
+        (self.home / "fake-keychain-locked").touch()
+        with patch.object(switch, "USES_KEYCHAIN", True):
+            with self.assertRaisesRegex(ValueError, "读取钥匙串登录信息失败：钥匙串已锁定.*security unlock-keychain"):
+                self.in_home(switch.switch_account, "2")
+        (self.home / "fake-keychain-locked").unlink()
+        (self.accounts / "account-2/.credentials.json").write_text("x" * 3000)
+        with patch.object(switch, "USES_KEYCHAIN", True):
+            with self.assertRaisesRegex(ValueError, "登录信息过长"):
+                self.in_home(switch.switch_account, "2")
+        self.assertIsNone(self.keychain())
+        self.assertEqual((self.accounts / "current").read_text(), "1\n")
 
     def test_add_creates_private_empty_directory_and_rejects_existing(self):
         result = self.command("add", "4")
